@@ -27,6 +27,8 @@ import time
 import os
 import re
 import sys
+import subprocess
+import tempfile
 import faulthandler
 from dataclasses import dataclass
 from typing import List, Optional
@@ -40,6 +42,9 @@ sys.stderr = _log_file           # ctranslate2 writes fatal errors to stderr
 # ── CUDA env fixes (must be set before any CUDA import) ───────────────────────
 os.environ.setdefault("CUDA_MODULE_LOADING", "LAZY")        # prevents init-time crashes
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "max_split_size_mb:512")
+
+# hf_xet (Rust download accelerator) crashes with illegal instruction on this CPU
+os.environ["HF_HUB_DISABLE_XET"] = "1"
 
 # ── NVIDIA + torch DLL registration (Windows) ─────────────────────────────────
 # ctranslate2 needs cudart64_12.dll (bundled in torch/lib) AND cuDNN/cuBLAS
@@ -141,6 +146,21 @@ class Pipeline:
         self._log(msg)
         _log_file.write(msg + "\n")
 
+    def _ensure_wav(self, path: str) -> str:
+        """If path is not a .wav, convert to temp .wav via ffmpeg so soundfile can read it."""
+        if path.lower().endswith(".wav"):
+            return path
+        tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+        tmp.close()
+        self._emit(f"[ffmpeg] extracting audio → {tmp.name}")
+        subprocess.run(
+            ["ffmpeg", "-y", "-i", path, "-vn", "-acodec", "pcm_s16le",
+             "-ar", "16000", "-ac", "1", tmp.name],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            check=True,
+        )
+        return tmp.name
+
     def transcribe(self, path: str, n_speakers: int, hf_token: str,
                    device: str = "cuda",
                    whisper_model: str = "medium") -> List[Subtitle]:
@@ -217,7 +237,8 @@ class Pipeline:
             dia_kwargs = {}
             if n_speakers > 0:
                 dia_kwargs["num_speakers"] = n_speakers
-            diarization = dia_pipe(path, **dia_kwargs)
+            audio_path = self._ensure_wav(path)
+            diarization = dia_pipe(audio_path, **dia_kwargs)
             turns = sorted(
                 (seg.start, seg.end, lbl)
                 for seg, _, lbl in diarization.itertracks(yield_label=True)
