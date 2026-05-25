@@ -472,6 +472,10 @@ class App(tk.Tk):
         self._on_llm_cleanup_toggle()   # sync UI with default (True)
         self._on_translate_toggle()     # sync UI with default (True)
         self._init_vlc()
+
+        # Keyboard shortcuts: Space / Enter to toggle play/pause
+        self.bind("<space>", self._on_space_toggle)
+        self.bind("<Return>", self._on_space_toggle)
         self.after(200, self._cuda_check)
         self._ui_loop()
 
@@ -587,7 +591,7 @@ class App(tk.Tk):
         seek = ttk.Scale(pc, variable=self.v_seek,
                           from_=0, to=1000, orient="horizontal")
         seek.pack(side="left", fill="x", expand=True, padx=8)
-        seek.bind("<ButtonPress-1>",   lambda _: setattr(self, "_seeking", True))
+        seek.bind("<ButtonPress-1>", self._on_seek_press)
         seek.bind("<ButtonRelease-1>", self._on_seek_release)
 
         tk.Label(pc, textvariable=self.v_time,
@@ -736,8 +740,11 @@ class App(tk.Tk):
             return
         self._embed_player()
         media = self.vlc_inst.media_new(self.media_file)
+        media.add_option(":no-sub")            # skip loading subtitle tracks
         self.player.set_media(media)
         self.player.play()
+        # Retry after a tick — spu track may not be available until playback starts
+        self.after(100, lambda: self.player.video_set_spu(-1))
         self.btn_play.config(text="⏸")
         self._sub_running = True
         threading.Thread(target=self._sub_sync_loop, daemon=True).start()
@@ -763,6 +770,12 @@ class App(tk.Tk):
                 pass
             time.sleep(0.08)
 
+    def _on_space_toggle(self, event):
+        """Space / Enter toggles play/pause, but not when typing in a text field."""
+        if isinstance(event.widget, (tk.Entry, tk.Text)):
+            return
+        self._toggle_play()
+
     def _toggle_play(self):
         if not self.player:
             return
@@ -771,10 +784,12 @@ class App(tk.Tk):
             self.btn_play.config(text="▶")
         else:
             if self.player.get_media() is None:
-                # Start playback if subtitles are available (even if still processing)
                 if self.subtitles:
                     self._load_and_play()
             else:
+                # If playback ended, seek back to start before replaying
+                if self.vlc and self.player.get_state() == self.vlc.State.Ended:
+                    self.player.stop()
                 self.player.play()
                 self.btn_play.config(text="⏸")
                 if not self._sub_running:
@@ -792,8 +807,21 @@ class App(tk.Tk):
             if L > 0:
                 self.player.set_time(max(0, L - 5000))
 
+    def _on_seek_press(self, event):
+        self._seeking = True
+        w = event.widget.winfo_width()
+        if w > 0:
+            frac = max(0.0, min(1.0, event.x / w))
+            self.v_seek.set(frac * 1000)
+            if self.player and self.player.get_length() > 0:
+                if self.vlc and self.player.get_state() == self.vlc.State.Ended:
+                    self.player.stop()
+                self.player.set_position(frac)
+
     def _on_seek_release(self, _event):
         if self.player and self.player.get_length() > 0:
+            if self.vlc and self.player.get_state() == self.vlc.State.Ended:
+                self.player.stop()
             self.player.set_position(self.v_seek.get() / 1000.0)
         self._seeking = False
 
