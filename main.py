@@ -77,13 +77,11 @@ if sys.platform == "win32":
 class Subtitle:
     start: float       # seconds
     end: float
-    speaker: str
     text: str
     translated: str = ""
 
     def display(self, use_translation: bool = False) -> str:
-        body = (self.translated or self.text) if use_translation else self.text
-        return f"[{self.speaker}]  {body}"
+        return (self.translated or self.text) if use_translation else self.text
 
 
 # ─── Helpers ───────────────────────────────────────────────────────────────────
@@ -109,7 +107,7 @@ def save_srt(subs: List[Subtitle], path: str, use_translation: bool) -> None:
     with open(path, "w", encoding="utf-8") as f:
         for i, s in enumerate(subs, 1):
             body = (s.translated or s.text) if use_translation else s.text
-            f.write(f"{i}\n{srt_time(s.start)} --> {srt_time(s.end)}\n{s.speaker}: {body}\n\n")
+            f.write(f"{i}\n{srt_time(s.start)} --> {srt_time(s.end)}\n{body}\n\n")
 
 
 def cache_path(media_file: str) -> str:
@@ -123,7 +121,7 @@ def save_cache(subs: List[Subtitle], media_file: str, translate_lang: str = "") 
         "media_file": media_file,
         "translate_lang": translate_lang,
         "subtitles": [
-            {"start": s.start, "end": s.end, "speaker": s.speaker,
+            {"start": s.start, "end": s.end,
              "text": s.text, "translated": s.translated}
             for s in subs
         ],
@@ -143,7 +141,6 @@ def load_cache(media_file: str) -> Optional[List[Subtitle]]:
     for d in data.get("subtitles", []):
         subs.append(Subtitle(
             start=d["start"], end=d["end"],
-            speaker=d.get("speaker", "SPEAKER_00"),
             text=d["text"], translated=d.get("translated", ""),
         ))
     return subs
@@ -184,205 +181,241 @@ class Pipeline:
         self._log(msg)
         _log_file.write(msg + "\n")
 
-    # ── ASR ───────────────────────────────────────────────────────────────
+    # ── Regex cleanup ─────────────────────────────────────────────────────
 
-    def _run_asr(self, device: str, whisper_model: str, ctype: str, path: str):
-        """Load faster-whisper + transcribe. Runs in its own thread."""
-        from faster_whisper import WhisperModel
+    def _regex_cleanup(self, text: str) -> str:
+        text = text[0].upper() + text[1:] if text else text
+        text = re.sub(r'\bi\b', 'I', text)
+        if text and text[-1].isalpha():
+            text += "."
+        text = re.sub(r'\s+([.,!?;:])', r'\1', text)
+        text = re.sub(r'([.,!?;:])(\S)', r'\1 \2', text)
+        text = re.sub(r'\b(\w+)\s+\1\b', r'\1', text)
+        text = re.sub(r'\s{2,}', ' ', text)
+        return text.strip()
 
-        self._emit("[ASR] load — start")
-        self._asr_prog(5, "loading model…")
-        asr = WhisperModel(whisper_model, device=device, compute_type=ctype)
-        self._emit("[ASR] load — done")
-        self._asr_prog(10, "model loaded")
+    # ── LLM cleanup ───────────────────────────────────────────────────────
 
-        if device == "cuda":
-            import torch as _t
-            _x = _t.zeros(4, 4, device="cuda")
-            _t.matmul(_x, _x)
-            _t.cuda.synchronize()
-            self._emit("[ASR] CUDA matmul OK")
+    def _llm_cleanup_batch(self, batch, model_name: str):
+        """Fix ASR errors per-line via LLM. Returns cleaned lines 1:1 with input."""
+        import ollama
 
-        self._emit(f"[ASR] transcribe — start")
-        self._asr_prog(12, "transcribing…")
-        seg_gen, info = asr.transcribe(
-            path, beam_size=5, word_timestamps=True, vad_filter=False)
-        duration = info.duration
-        raw_segs = []
-        for seg in seg_gen:
-            raw_segs.append(seg)
-            if duration > 0:
-                pct = 12 + int(83 * seg.end / duration)
-                self._asr_prog(min(pct, 95), f"{seg.end:.0f}s / {duration:.0f}s")
-        self._emit(f"[ASR] transcribe done — lang={info.language}  segs={len(raw_segs)}")
-        self._asr_prog(100, f"done — {len(raw_segs)} segments")
-        return raw_segs, info
+        lines = [s.text for s in batch]
+        block = "\n".join(f"<L{i}>{t}</L{i}>" for i, t in enumerate(lines))
+        prompt = (
+            "Fix punctuation, capitalization, and ASR errors in each line below.\n"
+            "Keep the exact same number of lines. Keep all <L#> tags unchanged.\n"
+            "Output only the corrected lines — nothing else.\n\n"
+            + block
+        )
+        try:
+            self._emit(f"[LLM] calling Ollama ({model_name}, {len(lines)} lines, {len(block)} chars)")
+            resp = ollama.generate(
+                model=model_name, prompt=prompt,
+                options={"num_predict": 512, "temperature": 0.0},
+            )
+            cleaned = []
+            for l in resp.response.strip().split("\n"):
+                l = l.strip()
+                if not l:
+                    continue
+                l = re.sub(r'</?L\d+>', '', l).strip()
+                cleaned.append(l)
+            self._emit(f"[LLM] Ollama returned {len(cleaned)} lines (expected {len(lines)})")
+        except Exception as e:
+            self._log(f"Ollama error: {e}")
+            self._emit(f"[LLM] Ollama FAILED — falling back to regex")
+            cleaned = [self._regex_cleanup(line) for line in lines]
 
-    def transcribe(self, path: str, device: str = "cuda",
-                   whisper_model: str = "large-v2",
-                   translate_lang: str = None) -> List[Subtitle]:
-        """Run ASR, then start translation early if needed. No diarization."""
+        # Ensure 1:1 alignment — pad or trim to match input count
+        while len(cleaned) < len(lines):
+            cleaned.append(lines[len(cleaned)])
+        cleaned = cleaned[:len(lines)]
+
+        # Build output subtitles, preserving original timestamps
+        out = []
+        for orig, text in zip(batch, cleaned):
+            out.append(Subtitle(
+                start=orig.start, end=orig.end,
+                text=text or orig.text,
+            ))
+        return out
+
+    # ── Streaming pipeline ────────────────────────────────────────────────
+
+    def run(self, path: str, device: str, whisper_model: str,
+            translate_lang: str = None, do_llm: bool = False,
+            model_name: str = "llama3.2:1b",
+            on_subtitle=None, on_first=None) -> List[Subtitle]:
+        """
+        Streaming 3-stage pipeline: ASR → LLM/regex → Translation.
+        All stages run concurrently via queues.
+        Returns the final subtitle list.
+        """
+        import queue
         import torch
+        from faster_whisper import WhisperModel
 
         if device == "cuda" and not torch.cuda.is_available():
             self._emit("WARNING: CUDA not available — falling back to CPU.")
             device = "cpu"
-
         ctype = "int8_float16" if device == "cuda" else "int8"
-        self._emit(f"[pipe] device={device}  model={whisper_model}  compute_type={ctype}")
+        self._emit(f"[pipe] device={device}  model={whisper_model}  do_llm={do_llm}")
         if device == "cuda":
             free, total = torch.cuda.mem_get_info(0)
             self._emit(f"       VRAM free={free//1024**2} MB / {total//1024**2} MB")
 
         self._prog(5, "Loading ASR model…")
+        self._asr_prog(5, "loading model…")
 
-        raw_segs, info = self._run_asr(device, whisper_model, ctype, path)
+        asr = WhisperModel(whisper_model, device=device, compute_type=ctype)
+        self._asr_prog(10, "model loaded")
+        if device == "cuda":
+            import torch as _t
+            _x = _t.zeros(4, 4, device="cuda")
+            _t.matmul(_x, _x)
+            _t.cuda.synchronize()
 
-        # Build subtitle objects
-        subs = []
-        for seg in raw_segs:
-            text = seg.text.strip()
-            if not text:
-                continue
-            subs.append(Subtitle(start=seg.start, end=seg.end,
-                                 speaker="SPEAKER_00", text=text))
-        self._emit(f"[ASR] done — {len(subs)} subtitles")
+        seg_gen, info = asr.transcribe(
+            path, beam_size=5, word_timestamps=True, vad_filter=False)
+        duration = info.duration
+        self._asr_prog(12, "transcribing…")
 
-        # Start translation immediately
-        if translate_lang and subs:
-            self._emit("[translate] starting…")
-            self._tra_prog(0, "starting…")
-            def _tra_thread():
-                self._translate_batch(subs, translate_lang,
-                                       offset=0, total=len(subs))
-                self._emit("[translate] done")
-            threading.Thread(target=_tra_thread, name="tra", daemon=True).start()
+        # Queues: raw → cleaned → final
+        raw_q = queue.Queue(maxsize=200)
+        clean_q = queue.Queue(maxsize=200)
 
-        self._prog(65, f"Ready — {len(subs)} subtitles")
-        return subs
+        final_subs: List[Subtitle] = []
+        total_segs = [0]   # mutable counter shared across threads
+        cleaned_count = [0]
+        tra_count = [0]
 
-    # ── Fast regex cleanup (no LLM, instant) ──────────────────────────────
+        # ── Stage 1: ASR producer ─────────────────────────────────────────
+        def asr_stage():
+            for seg in seg_gen:
+                text = seg.text.strip()
+                if not text:
+                    continue
+                total_segs[0] += 1
+                raw_q.put((seg.start, seg.end, text))
+                if duration > 0:
+                    pct = 12 + int(83 * seg.end / duration)
+                    self._asr_prog(min(pct, 99), f"{seg.end:.0f}s / {duration:.0f}s")
+            raw_q.put(None)  # sentinel
+            self._emit(f"[ASR] done — {total_segs[0]} segments")
+            self._asr_prog(100, f"done — {total_segs[0]} segs")
 
-    def _regex_cleanup(self, text: str) -> str:
-        """Basic ASR cleanup with regex — instant, no network/LLM needed."""
-        # Capitalize first letter
-        text = text[0].upper() + text[1:] if text else text
-        # Capitalize " i " → " I "
-        text = re.sub(r'\bi\b', 'I', text)
-        # Add period at end of sentence-like lines lacking punctuation
-        if text and text[-1].isalpha():
-            text += "."
-        # Fix spacing: no space before punctuation, one space after
-        text = re.sub(r'\s+([.,!?;:])', r'\1', text)
-        text = re.sub(r'([.,!?;:])(\S)', r'\1 \2', text)
-        # Remove repeated words (common ASR artifact)
-        text = re.sub(r'\b(\w+)\s+\1\b', r'\1', text)
-        # Collapse multiple spaces
-        text = re.sub(r'\s{2,}', ' ', text)
-        return text.strip()
-
-    def _fast_cleanup(self, subs: List[Subtitle]) -> List[Subtitle]:
-        """Apply regex cleanup to all subtitles — instant."""
-        for s in subs:
-            s.text = self._regex_cleanup(s.text)
-        return subs
-
-    # ── Streaming batch processing ────────────────────────────────────────
-
-    def _cleanup_one_batch(self, batch: List[Subtitle], model_name: str) -> List[Subtitle]:
-        """LLM cleanup for a single batch via Ollama."""
-        import ollama
-
-        lines = [f"[{s.speaker}] {s.text}" for s in batch]
-        block = "\n".join(lines)
-        prompt = (
-            "You are a transcript editor. Fix punctuation, capitalization, "
-            "and obvious ASR errors.\n"
-            "Keep the EXACT same number of lines unchanged.\n"
-            "Output only the corrected lines — nothing else.\n\n"
-            + block
-        )
-
-        try:
-            resp = ollama.generate(model=model_name, prompt=prompt)
-            cleaned = [l for l in resp.response.strip().split("\n") if l.strip()]
-        except Exception as e:
-            self._log(f"Ollama error: {e}")
-            cleaned = lines
-
-        out = []
-        for i, orig in enumerate(batch):
-            raw = cleaned[i] if i < len(cleaned) else f"[{orig.speaker}] {orig.text}"
-            m = re.match(r"\[([^\]]+)\]\s*(.*)", raw)
-            out.append(Subtitle(
-                start=orig.start,
-                end=orig.end,
-                speaker=m.group(1) if m else orig.speaker,
-                text=(m.group(2).strip() if m else raw.strip()) or orig.text,
-            ))
-        return out
-
-    def _translate_batch(self, batch: List[Subtitle], target: str,
-                          offset: int = 0, total: int = 0) -> List[Subtitle]:
-        """Translate a single batch via Google Translate."""
-        from deep_translator import GoogleTranslator
-
-        tr = GoogleTranslator(source="auto", target=target)
-        n = len(batch)
-        for i, s in enumerate(batch):
-            try:
-                s.translated = tr.translate(s.text) or s.text
-            except Exception as e:
-                self._log(f"Translate error: {e}")
-                s.translated = s.text
-            if total > 0:
-                pct = int(100 * (offset + i + 1) / total)
-                self._tra_prog(pct, f"{offset+i+1}/{total}")
-            time.sleep(0.05)
-        return batch
-
-    def process_batches(self, subs: List[Subtitle],
-                        model_name: str, translate_lang: str = None,
-                        on_batch=None, llm_cleanup: bool = False) -> List[Subtitle]:
-        """
-        Process subtitles: regex cleanup (instant) or LLM cleanup (slow), then optional translate.
-        Calls on_batch(batch_index, batch_subs) after each batch completes.
-        Returns the full processed list.
-        """
-        # Fast path: regex-only cleanup, no batching needed
-        if not llm_cleanup:
+        # ── Stage 2: Cleanup (LLM or regex) ───────────────────────────────
+        if do_llm:
+            self._emit("[LLM] per-line cleanup mode")
+            def cleanup_stage():
+                batch = []
+                batch_num = [0]
+                first = [True]
+                while True:
+                    item = raw_q.get()
+                    if item is None:
+                        if batch:
+                            self._emit("[LLM] processing final batch…")
+                            for sub in self._llm_cleanup_batch(batch, model_name):
+                                clean_q.put((sub.start, sub.end, sub.text))
+                                cleaned_count[0] += 1
+                        clean_q.put(None)
+                        self._emit(f"[LLM] done — {cleaned_count[0]} segments")
+                        # Unload Ollama model to free GPU memory for next run
+                        try:
+                            import ollama
+                            ollama.generate(model=model_name, prompt="ok", keep_alive=0,
+                                            options={"num_predict": 1})
+                        except Exception:
+                            pass
+                        break
+                    if first[0]:
+                        first[0] = False
+                        self._emit("[LLM] first segment arrived — buffering batches")
+                    batch.append(Subtitle(start=item[0], end=item[1], text=item[2]))
+                    chars = sum(len(s.text) for s in batch)
+                    if len(batch) >= 8 or chars >= 400:
+                        batch_num[0] += 1
+                        self._emit(f"[LLM] batch {batch_num[0]} — {len(batch)} segs, {chars} chars")
+                        for sub in self._llm_cleanup_batch(batch, model_name):
+                            clean_q.put((sub.start, sub.end, sub.text))
+                            cleaned_count[0] += 1
+                        self._emit(f"[LLM] batch {batch_num[0]} done — total {cleaned_count[0]}")
+                        batch = []
+        else:
             self._emit("[cleanup] regex fast path")
-            subs = self._fast_cleanup(subs)
-            # Trigger playback immediately — translation runs in background after
-            if on_batch:
-                on_batch(0, subs)
-            if translate_lang:
-                self._emit("[translate] background — original text shown until ready")
-                subs = self._translate_batch(subs, translate_lang,
-                                              offset=0, total=len(subs))
-            self._emit("[cleanup] done")
-            return subs
+            def cleanup_stage():
+                while True:
+                    item = raw_q.get()
+                    if item is None:
+                        clean_q.put(None)
+                        self._emit(f"[cleanup] done — {cleaned_count[0]} segments")
+                        break
+                    text = self._regex_cleanup(item[2])
+                    clean_q.put((item[0], item[1], text))
+                    cleaned_count[0] += 1
 
-        # Slow path: LLM cleanup in batches
-        chunk_size = 25
-        total_batches = (len(subs) + chunk_size - 1) // chunk_size
-        out: List[Subtitle] = []
+        # ── Stage 3: Translation ──────────────────────────────────────────
+        if translate_lang:
+            self._emit(f"[translate] → {translate_lang}")
+            self._tra_prog(0, "waiting…")
+            def tra_stage():
+                from deep_translator import GoogleTranslator
+                tr = GoogleTranslator(source="auto", target=translate_lang)
+                first = True
+                while True:
+                    item = clean_q.get()
+                    if item is None:
+                        self._emit(f"[translate] done — {tra_count[0]}")
+                        self._tra_prog(100, f"done — {tra_count[0]}")
+                        break
+                    start_t, end_t, text = item
+                    translated = tr.translate(text) or text
+                    sub = Subtitle(start=start_t, end=end_t,                                    text=text, translated=translated)
+                    final_subs.append(sub)
+                    if on_subtitle:
+                        on_subtitle(sub)
+                    if first and on_first:
+                        first = False; on_first()
+                    tra_count[0] += 1
+                    if cleaned_count[0] > 0:
+                        pct = int(100 * tra_count[0] / max(1, cleaned_count[0]))
+                        self._tra_prog(min(pct, 99), f"{tra_count[0]}/{cleaned_count[0]}")
+                    time.sleep(0.05)
+        else:
+            self._tra_prog(0, "waiting…")
+            def tra_stage():
+                first = True
+                while True:
+                    item = clean_q.get()
+                    if item is None:
+                        self._tra_prog(100, "done")
+                        break
+                    sub = Subtitle(start=item[0], end=item[1],                                    text=item[2])
+                    final_subs.append(sub)
+                    if on_subtitle:
+                        on_subtitle(sub)
+                    if first and on_first:
+                        first = False; on_first()
+                    tra_count[0] += 1
 
-        for bi in range(total_batches):
-            batch = subs[bi * chunk_size : (bi + 1) * chunk_size]
-            self._emit(f"[batch {bi+1}/{total_batches}] LLM cleanup…")
-            cleaned = self._cleanup_one_batch(batch, model_name)
-            out.extend(cleaned)
-            # Trigger playback after first batch — translation runs after
-            if on_batch:
-                on_batch(bi, cleaned)
-            if translate_lang:
-                cleaned = self._translate_batch(cleaned, translate_lang,
-                                                 offset=bi * chunk_size,
-                                                 total=len(subs))
+        # ── Launch all stages ─────────────────────────────────────────────
+        t1 = threading.Thread(target=asr_stage, name="asr")
+        t2 = threading.Thread(target=cleanup_stage, name="cleanup")
+        t3 = threading.Thread(target=tra_stage, name="tra")
+        t1.start(); t2.start(); t3.start()
+        t1.join(); t2.join(); t3.join()
 
-        self._emit(f"[batch] all {total_batches} batches done")
-        return out
+        self._emit(f"[pipe] complete — {len(final_subs)} subtitles")
+        self._prog(100, f"Done — {len(final_subs)} subtitles")
+        # Free GPU memory for next run
+        del asr, seg_gen
+        if device == "cuda":
+            import torch, gc
+            torch.cuda.empty_cache()
+            gc.collect()
+        return final_subs
 
 
 # ─── UI Colours ────────────────────────────────────────────────────────────────
@@ -424,7 +457,7 @@ class App(tk.Tk):
         self.v_translate    = tk.BooleanVar(value=True)
         self.v_llm_cleanup = tk.BooleanVar(value=True)
         self.v_lang      = tk.StringVar(value="ko")
-        self.v_model     = tk.StringVar(value="llama3.2")
+        self.v_model     = tk.StringVar(value="llama3.2:1b")
         self.v_status    = tk.StringVar(value="Ready — browse a file to begin.")
         self.v_progress  = tk.DoubleVar(value=0)
         self.v_asr_prog  = tk.DoubleVar(value=0)
@@ -488,18 +521,14 @@ class App(tk.Tk):
         self.cmb_lang["values"] = [
             "ko", "zh-CN", "zh-TW", "ja", "fr", "de", "es", "ru", "ar", "pt"
         ]
-        self.cmb_lang.pack(side="left", padx=2)
+        self.cmb_lang.pack(side="left", padx=(2, 14))
 
-        # Whisper model row
-        wr = tk.Frame(top, bg=PANEL)
-        wr.pack(fill="x", padx=6, pady=(0, 2))
-        self._lbl(wr, "Whisper Model:").pack(side="left")
-        cmb_wm = ttk.Combobox(wr, textvariable=self.v_whisper_model,
+        self._lbl(sr, "Whisper:").pack(side="left")
+        cmb_wm = ttk.Combobox(sr, textvariable=self.v_whisper_model,
                                width=10, state="readonly")
         cmb_wm["values"] = ["tiny", "base", "small", "medium",
                              "large-v2", "large-v3"]
-        cmb_wm.pack(side="left", padx=(2, 0))
-        self._lbl(wr, "  (medium ≈ balance)", fg="#888").pack(side="left")
+        cmb_wm.pack(side="left", padx=2)
 
         # Action row
         ar = tk.Frame(top, bg=PANEL)
@@ -655,51 +684,35 @@ class App(tk.Tk):
             pipe = Pipeline(self._log, self._set_prog,
                             asr_prog_cb=self._set_asr_prog,
                             tra_prog_cb=self._set_tra_prog)
-            mdl           = self.v_model.get().strip() or "llama3.2"
+            mdl           = self.v_model.get().strip() or "llama3.2:1b"
             device        = self.v_device.get()
             whisper_model = self.v_whisper_model.get()
             translate_lang = self.v_lang.get() if self.v_translate.get() else None
             do_llm        = self.v_llm_cleanup.get()
 
-            # Phase 1: ASR (translation starts immediately inside)
-            early_tra = translate_lang if not do_llm else None
-            subs = pipe.transcribe(self.media_file, device, whisper_model,
-                                   translate_lang=early_tra)
-
-            # Phase 3: Cleanup (regex or LLM) + optional translation
-            # Skip translation if already done early (fast path)
-            post_tra = translate_lang if do_llm else None
-            if do_llm:
-                self._set_prog(70, "LLM cleanup…")
-            else:
-                self._set_prog(70, "Cleanup…")
-
-            first_batch = [True]
-            def on_batch(batch_idx: int, batch_subs: list):
+            def on_subtitle(sub):
                 with self._batch_lock:
-                    self.subtitles.extend(batch_subs)
-                total = max(1, (len(subs) + 24) // 25) if do_llm else 1
-                pct = 70 + int(30 * (batch_idx + 1) / total)
-                done_msg = ""
-                if first_batch[0]:
-                    first_batch[0] = False
-                    done_msg = " — ✓ ready to play"
-                    self.after(200, self._enable_early_play)
-                self._set_prog(pct, f"Batch {batch_idx+1}/{total}{done_msg}")
+                    self.subtitles.append(sub)
 
-            all_subs = pipe.process_batches(subs, mdl, post_tra, on_batch,
-                                            llm_cleanup=do_llm)
+            def on_first():
+                self.after(200, self._enable_early_play)
 
-            # Save cache + SRT with final subtitle list
+            all_subs = pipe.run(
+                self.media_file, device, whisper_model,
+                translate_lang=translate_lang,
+                do_llm=do_llm, model_name=mdl,
+                on_subtitle=on_subtitle, on_first=on_first)
+
+            # Set subtitles and save
+            with self._batch_lock:
+                self.subtitles = all_subs
+                self.is_processed = True
+
             base = os.path.splitext(self.media_file)[0]
             self.srt_path = base + "_ai.srt"
             save_cache(all_subs, self.media_file, translate_lang or "")
             save_srt(all_subs, self.srt_path, self.v_translate.get())
             self._log(f"Saved → {self.srt_path}  (+ cache)")
-
-            self._set_prog(100, "Done")
-            with self._batch_lock:
-                self.is_processed = True
 
         except Exception as e:
             import traceback
