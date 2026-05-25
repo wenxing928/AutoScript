@@ -27,8 +27,6 @@ import time
 import os
 import re
 import sys
-import subprocess
-import tempfile
 import faulthandler
 from dataclasses import dataclass
 from typing import List, Optional
@@ -176,33 +174,17 @@ _dotenv = _load_dotenv()
 
 class Pipeline:
     def __init__(self, log_cb, progress_cb,
-                 asr_prog_cb=None, dia_prog_cb=None, tra_prog_cb=None):
+                 asr_prog_cb=None, tra_prog_cb=None):
         self._log = log_cb
         self._prog = progress_cb
         self._asr_prog = asr_prog_cb or (lambda p, m: None)
-        self._dia_prog = dia_prog_cb or (lambda p, m: None)
         self._tra_prog = tra_prog_cb or (lambda p, m: None)
 
     def _emit(self, msg: str):
         self._log(msg)
         _log_file.write(msg + "\n")
 
-    def _ensure_wav(self, path: str) -> str:
-        """If path is not a .wav, convert to temp .wav via ffmpeg so soundfile can read it."""
-        if path.lower().endswith(".wav"):
-            return path
-        tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
-        tmp.close()
-        self._emit(f"[ffmpeg] extracting audio → {tmp.name}")
-        subprocess.run(
-            ["ffmpeg", "-y", "-i", path, "-vn", "-acodec", "pcm_s16le",
-             "-ar", "16000", "-ac", "1", tmp.name],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            check=True,
-        )
-        return tmp.name
-
-    # ── Parallel ASR + Diarization ─────────────────────────────────────────
+    # ── ASR ───────────────────────────────────────────────────────────────
 
     def _run_asr(self, device: str, whisper_model: str, ctype: str, path: str):
         """Load faster-whisper + transcribe. Runs in its own thread."""
@@ -236,46 +218,10 @@ class Pipeline:
         self._asr_prog(100, f"done — {len(raw_segs)} segments")
         return raw_segs, info
 
-    def _run_diarization(self, hf_token: str, path: str, n_speakers: int):
-        """Load pyannote + diarize. Runs in its own thread (CPU only)."""
-        import torch
-        from pyannote.audio import Pipeline as PyannoteP
-
-        self._emit("[DIA] load — start")
-        self._dia_prog(5, "loading model…")
-        dia_pipe = PyannoteP.from_pretrained(
-            "pyannote/speaker-diarization-3.1",
-            use_auth_token=hf_token,
-        )
-        dia_pipe = dia_pipe.to(torch.device("cpu"))
-        self._emit("[DIA] load — done")
-        self._dia_prog(15, "model loaded")
-
-        audio_path = self._ensure_wav(path)
-        dia_kwargs = {}
-        if n_speakers > 0:
-            dia_kwargs["num_speakers"] = n_speakers
-        self._emit("[DIA] diarize — start")
-        self._dia_prog(20, "diarizing…")
-        diarization = dia_pipe(audio_path, **dia_kwargs)
-        turns = sorted(
-            (seg.start, seg.end, lbl)
-            for seg, _, lbl in diarization.itertracks(yield_label=True)
-        )
-        self._emit(f"[DIA] diarize done — turns={len(turns)}")
-        self._dia_prog(100, f"done — {len(turns)} turns")
-        return turns
-
-    def transcribe(self, path: str, n_speakers: int, hf_token: str,
-                   device: str = "cuda",
+    def transcribe(self, path: str, device: str = "cuda",
                    whisper_model: str = "medium",
                    translate_lang: str = None) -> List[Subtitle]:
-        """
-        Runs ASR and diarization in parallel, then merges results.
-        If translate_lang is set, translation starts as soon as ASR finishes
-        (runs in parallel with diarization on CPU).
-        ASR uses GPU (faster-whisper/ctranslate2), diarization uses CPU (pyannote).
-        """
+        """Run ASR, then start translation early if needed. No diarization."""
         import torch
 
         if device == "cuda" and not torch.cuda.is_available():
@@ -288,112 +234,31 @@ class Pipeline:
             free, total = torch.cuda.mem_get_info(0)
             self._emit(f"       VRAM free={free//1024**2} MB / {total//1024**2} MB")
 
-        self._prog(5, "Loading ASR + diarization models in parallel…")
+        self._prog(5, "Loading ASR model…")
 
-        # ── Launch ASR and diarization in parallel threads ────────────────
-        asr_result = {}
-        dia_result = {}
-        has_dia = bool(hf_token)
+        raw_segs, info = self._run_asr(device, whisper_model, ctype, path)
 
-        def _asr_thread():
-            try:
-                asr_result["data"] = self._run_asr(device, whisper_model, ctype, path)
-            except Exception as e:
-                asr_result["error"] = e
-
-        def _dia_thread():
-            try:
-                dia_result["data"] = self._run_diarization(hf_token, path, n_speakers)
-            except Exception as e:
-                dia_result["error"] = e
-
-        t_asr = threading.Thread(target=_asr_thread, name="asr")
-        t_dia = threading.Thread(target=_dia_thread, name="dia")
-
-        if has_dia:
-            t_asr.start()
-            t_dia.start()
-        else:
-            t_asr.start()
-
-        # ── Wait for ASR, then start translation early (parallel with DIA) ─
-        t_asr.join()
-        if "error" in asr_result:
-            self._emit(f"[ASR] FAILED: {asr_result['error']}")
-            self._emit("  Model files may not be cached. First run downloads them from HuggingFace.")
-            raise asr_result["error"]
-        raw_segs, info = asr_result["data"]
-
-        # Build temp subtitles from ASR and start translation while DIA runs
-        temp_subs = []
-        for seg in raw_segs:
-            text = seg.text.strip()
-            if not text:
-                continue
-            temp_subs.append(Subtitle(start=seg.start, end=seg.end,
-                                       speaker="", text=text))
-
-        tra_done = [True]  # mutable; True if no translation needed
-        if translate_lang and temp_subs:
-            self._emit("[translate] starting early — parallel with diarization")
-            self._tra_prog(0, "starting…")
-            tra_done[0] = False
-            def _tra_thread():
-                self._translate_batch(temp_subs, translate_lang,
-                                       offset=0, total=len(temp_subs))
-                tra_done[0] = True
-                self._emit("[translate] early pass done")
-            threading.Thread(target=_tra_thread, name="tra-early", daemon=True).start()
-
-        # ── Wait for diarization ──────────────────────────────────────────
-        if has_dia:
-            t_dia.join()
-
-        # ── Check diarization result ──────────────────────────────────────
-        turns = None
-        if has_dia:
-            if "error" in dia_result:
-                self._emit(f"[DIA] FAILED: {dia_result['error']}")
-            else:
-                turns = dia_result["data"]
-
-        # ── Build speaker lookup ──────────────────────────────────────────
-        if turns:
-            def _speaker_at(t: float) -> str:
-                for s, e, lbl in turns:
-                    if s <= t <= e:
-                        return lbl
-                    if s > t:
-                        break
-                return "SPEAKER_00"
-        else:
-            self._emit("[DIA] unavailable — using default speaker")
-            self._emit("  (HF token may be missing, or accept the license at:")
-            self._emit("   https://huggingface.co/pyannote/speaker-diarization-3.1)")
-            def _speaker_at(t: float) -> str:
-                return "SPEAKER_00"
-
-        # ── Merge ASR segments with speaker labels ────────────────────────
-        self._prog(65, "Merging speakers…")
-        self._emit("[merge] building subtitles")
+        # Build subtitle objects
         subs = []
-        ti = 0  # index into temp_subs (for copying early translations)
         for seg in raw_segs:
             text = seg.text.strip()
             if not text:
                 continue
-            mid = (seg.start + seg.end) / 2
-            # Copy translation from temp_subs if early translation ran
-            translated = ""
-            if translate_lang and ti < len(temp_subs):
-                translated = temp_subs[ti].translated
-            subs.append(Subtitle(
-                start=seg.start, end=seg.end,
-                speaker=_speaker_at(mid), text=text,
-                translated=translated,
-            ))
-            ti += 1
-        self._emit(f"[merge] done — subtitles={len(subs)}")
+            subs.append(Subtitle(start=seg.start, end=seg.end,
+                                 speaker="SPEAKER_00", text=text))
+        self._emit(f"[ASR] done — {len(subs)} subtitles")
+
+        # Start translation immediately
+        if translate_lang and subs:
+            self._emit("[translate] starting…")
+            self._tra_prog(0, "starting…")
+            def _tra_thread():
+                self._translate_batch(subs, translate_lang,
+                                       offset=0, total=len(subs))
+                self._emit("[translate] done")
+            threading.Thread(target=_tra_thread, name="tra", daemon=True).start()
+
+        self._prog(65, f"Ready — {len(subs)} subtitles")
         return subs
 
     # ── Fast regex cleanup (no LLM, instant) ──────────────────────────────
@@ -561,15 +426,12 @@ class App(tk.Tk):
         self.v_translate    = tk.BooleanVar(value=False)
         self.v_llm_cleanup = tk.BooleanVar(value=False)
         self.v_lang      = tk.StringVar(value="zh-CN")
-        self.v_hf        = tk.StringVar(value=_dotenv.get("HF_TOKEN", ""))
         self.v_model     = tk.StringVar(value="llama3.2")
         self.v_status    = tk.StringVar(value="Ready — browse a file to begin.")
         self.v_progress  = tk.DoubleVar(value=0)
         self.v_asr_prog  = tk.DoubleVar(value=0)
-        self.v_dia_prog  = tk.DoubleVar(value=0)
         self.v_tra_prog  = tk.DoubleVar(value=0)
         self.v_asr_label = tk.StringVar(value="")
-        self.v_dia_label = tk.StringVar(value="")
         self.v_tra_label = tk.StringVar(value="")
         self.v_subtitle  = tk.StringVar(value="")
         self.v_time      = tk.StringVar(value="0:00:00 / 0:00:00")
@@ -643,8 +505,7 @@ class App(tk.Tk):
         cmb_wm["values"] = ["tiny", "base", "small", "medium",
                              "large-v2", "large-v3"]
         cmb_wm.pack(side="left", padx=(2, 0))
-        self._lbl(wr, "  (start with 'medium' if large crashes)",
-                  fg="#888").pack(side="left")
+        self._lbl(wr, "  (medium ≈ balance)", fg="#888").pack(side="left")
 
         # Action row
         ar = tk.Frame(top, bg=PANEL)
@@ -662,7 +523,6 @@ class App(tk.Tk):
         pp.pack(fill="x", padx=8, pady=(2, 0))
         for var, lbl_var, color, name in [
             (self.v_asr_prog, self.v_asr_label, "#e74c3c", "ASR"),
-            (self.v_dia_prog, self.v_dia_label, "#3498db", "DIA"),
             (self.v_tra_prog, self.v_tra_label, "#2ecc71", "TRA"),
         ]:
             row = tk.Frame(pp, bg=PANEL)
@@ -800,20 +660,17 @@ class App(tk.Tk):
         try:
             pipe = Pipeline(self._log, self._set_prog,
                             asr_prog_cb=self._set_asr_prog,
-                            dia_prog_cb=self._set_dia_prog,
                             tra_prog_cb=self._set_tra_prog)
             n             = self.v_speakers.get()
-            tok           = self.v_hf.get().strip()
             mdl           = self.v_model.get().strip() or "llama3.2"
             device        = self.v_device.get()
             whisper_model = self.v_whisper_model.get()
             translate_lang = self.v_lang.get() if self.v_translate.get() else None
             do_llm        = self.v_llm_cleanup.get()
 
-            # Phase 1+2: Parallel ASR + diarization, then merge.
-            # Fast path: start translation early (parallel with diarization)
+            # Phase 1: ASR (translation starts immediately inside)
             early_tra = translate_lang if not do_llm else None
-            subs = pipe.transcribe(self.media_file, n, tok, device, whisper_model,
+            subs = pipe.transcribe(self.media_file, device, whisper_model,
                                    translate_lang=early_tra)
 
             # Phase 3: Cleanup (regex or LLM) + optional translation
@@ -1007,20 +864,14 @@ class App(tk.Tk):
         self.after(0, lambda: self.v_asr_prog.set(pct))
         self.after(0, lambda: self.v_asr_label.set(msg))
 
-    def _set_dia_prog(self, pct: float, msg: str = ""):
-        self.after(0, lambda: self.v_dia_prog.set(pct))
-        self.after(0, lambda: self.v_dia_label.set(msg))
-
     def _set_tra_prog(self, pct: float, msg: str = ""):
         self.after(0, lambda: self.v_tra_prog.set(pct))
         self.after(0, lambda: self.v_tra_label.set(msg))
 
     def _reset_parallel_bars(self):
         self.after(0, lambda: self.v_asr_prog.set(0))
-        self.after(0, lambda: self.v_dia_prog.set(0))
         self.after(0, lambda: self.v_tra_prog.set(0))
         self.after(0, lambda: self.v_asr_label.set(""))
-        self.after(0, lambda: self.v_dia_label.set(""))
         self.after(0, lambda: self.v_tra_label.set(""))
 
     def _on_close(self):
