@@ -15,8 +15,8 @@ Usage:
 
 Pipeline:
     1. Browse a media file (video or audio)
-    2. Set speaker count + optional translation
-    3. Click "Prepare & Process" — runs faster-whisper ASR → Ollama LLM cleanup → (optional) Google Translate
+    2. Set optional translation
+    3. Click "Prepare & Process" — runs faster-whisper ASR → cleanup → (optional) Google Translate
     4. Press Play — subtitles sync automatically during playback
 """
 
@@ -219,7 +219,7 @@ class Pipeline:
         return raw_segs, info
 
     def transcribe(self, path: str, device: str = "cuda",
-                   whisper_model: str = "medium",
+                   whisper_model: str = "large-v2",
                    translate_lang: str = None) -> List[Subtitle]:
         """Run ASR, then start translation early if needed. No diarization."""
         import torch
@@ -289,17 +289,16 @@ class Pipeline:
 
     # ── Streaming batch processing ────────────────────────────────────────
 
-    def _cleanup_one_batch(self, batch: List[Subtitle], n_speakers: int,
-                           model_name: str) -> List[Subtitle]:
+    def _cleanup_one_batch(self, batch: List[Subtitle], model_name: str) -> List[Subtitle]:
         """LLM cleanup for a single batch via Ollama."""
         import ollama
 
         lines = [f"[{s.speaker}] {s.text}" for s in batch]
         block = "\n".join(lines)
         prompt = (
-            f"You are a transcript editor. There are {n_speakers} speaker(s).\n"
-            "Fix punctuation, capitalization, and obvious ASR errors.\n"
-            "Keep the EXACT same number of lines and [SPEAKER_XX] labels unchanged.\n"
+            "You are a transcript editor. Fix punctuation, capitalization, "
+            "and obvious ASR errors.\n"
+            "Keep the EXACT same number of lines unchanged.\n"
             "Output only the corrected lines — nothing else.\n\n"
             + block
         )
@@ -342,7 +341,7 @@ class Pipeline:
             time.sleep(0.05)
         return batch
 
-    def process_batches(self, subs: List[Subtitle], n_speakers: int,
+    def process_batches(self, subs: List[Subtitle],
                         model_name: str, translate_lang: str = None,
                         on_batch=None, llm_cleanup: bool = False) -> List[Subtitle]:
         """
@@ -372,7 +371,7 @@ class Pipeline:
         for bi in range(total_batches):
             batch = subs[bi * chunk_size : (bi + 1) * chunk_size]
             self._emit(f"[batch {bi+1}/{total_batches}] LLM cleanup…")
-            cleaned = self._cleanup_one_batch(batch, n_speakers, model_name)
+            cleaned = self._cleanup_one_batch(batch, model_name)
             out.extend(cleaned)
             # Trigger playback after first batch — translation runs after
             if on_batch:
@@ -420,12 +419,11 @@ class App(tk.Tk):
         self.vlc_inst = None
 
         # tk variables
-        self.v_speakers     = tk.IntVar(value=2)
         self.v_device       = tk.StringVar(value="cuda")
-        self.v_whisper_model = tk.StringVar(value="medium")
-        self.v_translate    = tk.BooleanVar(value=False)
-        self.v_llm_cleanup = tk.BooleanVar(value=False)
-        self.v_lang      = tk.StringVar(value="zh-CN")
+        self.v_whisper_model = tk.StringVar(value="large-v2")
+        self.v_translate    = tk.BooleanVar(value=True)
+        self.v_llm_cleanup = tk.BooleanVar(value=True)
+        self.v_lang      = tk.StringVar(value="ko")
         self.v_model     = tk.StringVar(value="llama3.2")
         self.v_status    = tk.StringVar(value="Ready — browse a file to begin.")
         self.v_progress  = tk.DoubleVar(value=0)
@@ -438,6 +436,8 @@ class App(tk.Tk):
         self.v_seek      = tk.DoubleVar(value=0)
 
         self._build_ui()
+        self._on_llm_cleanup_toggle()   # sync UI with default (True)
+        self._on_translate_toggle()     # sync UI with default (True)
         self._init_vlc()
         self.after(200, self._cuda_check)
         self._ui_loop()
@@ -464,28 +464,11 @@ class App(tk.Tk):
         sr = tk.Frame(top, bg=PANEL)
         sr.pack(fill="x", padx=6, pady=3)
 
-        self._lbl(sr, "Speakers:").pack(side="left")
-        tk.Spinbox(sr, from_=1, to=10, textvariable=self.v_speakers,
-                   width=3, bg=ACCENT, fg="white",
-                   buttonbackground=ACCENT, insertbackground="white",
-                   relief="flat").pack(side="left", padx=(2, 14))
-
         self._lbl(sr, "Device:").pack(side="left")
         self.cmb_device = ttk.Combobox(sr, textvariable=self.v_device,
                                         width=6, state="readonly")
         self.cmb_device["values"] = ["cuda", "cpu"]
         self.cmb_device.pack(side="left", padx=(2, 14))
-
-        tk.Checkbutton(sr, text="Translate", variable=self.v_translate,
-                       bg=PANEL, fg="white", selectcolor=ACCENT,
-                       activebackground=PANEL, activeforeground="white",
-                       command=self._on_translate_toggle).pack(side="left")
-        self.cmb_lang = ttk.Combobox(sr, textvariable=self.v_lang,
-                                      width=8, state="disabled")
-        self.cmb_lang["values"] = [
-            "zh-CN", "zh-TW", "ja", "ko", "fr", "de", "es", "ru", "ar", "pt"
-        ]
-        self.cmb_lang.pack(side="left", padx=(2, 14))
 
         tk.Checkbutton(sr, text="LLM Cleanup", variable=self.v_llm_cleanup,
                        bg=PANEL, fg="white", selectcolor=ACCENT,
@@ -494,7 +477,18 @@ class App(tk.Tk):
         self.ent_model = tk.Entry(sr, textvariable=self.v_model, width=13,
                                    bg=ACCENT, fg="white", insertbackground="white",
                                    relief="flat", state="disabled")
-        self.ent_model.pack(side="left", padx=2)
+        self.ent_model.pack(side="left", padx=(2, 14))
+
+        tk.Checkbutton(sr, text="Translate", variable=self.v_translate,
+                       bg=PANEL, fg="white", selectcolor=ACCENT,
+                       activebackground=PANEL, activeforeground="white",
+                       command=self._on_translate_toggle).pack(side="left")
+        self.cmb_lang = ttk.Combobox(sr, textvariable=self.v_lang,
+                                      width=8, state="disabled")
+        self.cmb_lang["values"] = [
+            "ko", "zh-CN", "zh-TW", "ja", "fr", "de", "es", "ru", "ar", "pt"
+        ]
+        self.cmb_lang.pack(side="left", padx=2)
 
         # Whisper model row
         wr = tk.Frame(top, bg=PANEL)
@@ -661,7 +655,6 @@ class App(tk.Tk):
             pipe = Pipeline(self._log, self._set_prog,
                             asr_prog_cb=self._set_asr_prog,
                             tra_prog_cb=self._set_tra_prog)
-            n             = self.v_speakers.get()
             mdl           = self.v_model.get().strip() or "llama3.2"
             device        = self.v_device.get()
             whisper_model = self.v_whisper_model.get()
@@ -694,7 +687,7 @@ class App(tk.Tk):
                     self.after(200, self._enable_early_play)
                 self._set_prog(pct, f"Batch {batch_idx+1}/{total}{done_msg}")
 
-            all_subs = pipe.process_batches(subs, n, mdl, post_tra, on_batch,
+            all_subs = pipe.process_batches(subs, mdl, post_tra, on_batch,
                                             llm_cleanup=do_llm)
 
             # Save cache + SRT with final subtitle list
