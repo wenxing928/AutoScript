@@ -197,48 +197,140 @@ class Pipeline:
     # ── LLM cleanup ───────────────────────────────────────────────────────
 
     def _llm_cleanup_batch(self, batch, model_name: str):
-        """Fix ASR errors per-line via LLM. Returns cleaned lines 1:1 with input."""
-        import ollama
-
+        """Fix ASR errors via LLM. Lines may be merged or split to form complete sentences."""
         lines = [s.text for s in batch]
-        block = "\n".join(f"<L{i}>{t}</L{i}>" for i, t in enumerate(lines))
+        block = "\n".join(lines)
         prompt = (
-            "Fix punctuation, capitalization, and ASR errors in each line below.\n"
-            "Keep the exact same number of lines. Keep all <L#> tags unchanged.\n"
-            "Output only the corrected lines — nothing else.\n\n"
+            "You are a subtitle editor. Below are raw ASR transcript lines in order.\n"
+            "Reconstruct them into complete, grammatically correct sentences.\n"
+            "Merge fragments and split run-on sentences as needed.\n"
+            "Fix ASR errors, punctuation, capitalization, and word fragments.\n"
+            "Your output will be displayed directly as subtitles.\n"
+            "Do NOT add any preamble, commentary, or sentence numbering (no \"1.\", \"2.\", etc.).\n"
+            "Invoca, Workato, Service Titan, Backstage, MCP, FDE, Next Health and University Hospital are proper noun frequently addressed in video.\n"
+            "Trent, Anneke, Nab, Christian, Whitney, Landon, Pierce, Justin, Muzafar, Toshishi, Beth, Ola, Evan, Ian and Nancy are people's name frequently addressed in video.\n"
+            "But asr may misrecognize them, you need to modify them.\n"
+            "Output one complete sentence per line — nothing else.\n\n"
             + block
         )
+
+        if model_name.endswith(":cloud"):
+            cleaned = self._call_cloud_api(model_name, prompt, lines)
+        else:
+            cleaned = self._call_ollama(model_name, prompt, lines)
+
+        return self._align_sentences(batch, cleaned)
+
+    def _call_ollama(self, model_name: str, prompt: str, lines: list) -> list:
+        import ollama
         try:
-            self._emit(f"[LLM] calling Ollama ({model_name}, {len(lines)} lines, {len(block)} chars)")
+            self._emit(f"[LLM] calling Ollama ({model_name}, {len(lines)} lines, {len(prompt)} chars)")
             resp = ollama.generate(
                 model=model_name, prompt=prompt,
                 options={"num_predict": 512, "temperature": 0.0},
             )
-            cleaned = []
-            for l in resp.response.strip().split("\n"):
-                l = l.strip()
-                if not l:
-                    continue
-                l = re.sub(r'</?L\d+>', '', l).strip()
-                cleaned.append(l)
-            self._emit(f"[LLM] Ollama returned {len(cleaned)} lines (expected {len(lines)})")
+            cleaned = self._parse_llm_response(resp.response.strip().split("\n"))
+            self._emit(f"[LLM] Ollama returned {len(cleaned)} sentences (input had {len(lines)} lines)")
+            return cleaned
         except Exception as e:
             self._log(f"Ollama error: {e}")
             self._emit(f"[LLM] Ollama FAILED — falling back to regex")
-            cleaned = [self._regex_cleanup(line) for line in lines]
+            return [self._regex_cleanup(line) for line in lines]
 
-        # Ensure 1:1 alignment — pad or trim to match input count
-        while len(cleaned) < len(lines):
-            cleaned.append(lines[len(cleaned)])
-        cleaned = cleaned[:len(lines)]
+    def _call_cloud_api(self, model_name: str, prompt: str, lines: list) -> list:
+        import json, urllib.request
 
-        # Build output subtitles, preserving original timestamps
+        base_model = model_name.replace(":cloud", "")
+        api_key = _dotenv.get("DEEPSEEK_API_KEY", "")
+        if not api_key:
+            self._log("DEEPSEEK_API_KEY not set in .env")
+            self._emit("[LLM] Cloud API FAILED — no API key, falling back to regex")
+            return [self._regex_cleanup(line) for line in lines]
+
+        body = json.dumps({
+            "model": base_model,
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": 2048,
+            "temperature": 0.0,
+        }).encode("utf-8")
+
+        req = urllib.request.Request(
+            "https://api.deepseek.com/v1/chat/completions",
+            data=body,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {api_key}",
+            },
+        )
+
+        try:
+            self._emit(f"[LLM] calling DeepSeek API ({base_model}, {len(lines)} lines, {len(prompt)} chars)")
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                data = json.loads(resp.read())
+            content = data["choices"][0]["message"]["content"]
+            cleaned = self._parse_llm_response(content.strip().split("\n"))
+            self._emit(f"[LLM] DeepSeek returned {len(cleaned)} sentences (input had {len(lines)} lines)")
+            return cleaned
+        except Exception as e:
+            self._log(f"DeepSeek API error: {e}")
+            self._emit(f"[LLM] DeepSeek FAILED — falling back to regex")
+            return [self._regex_cleanup(line) for line in lines]
+
+    def _parse_llm_response(self, raw_lines: list) -> list:
+        cleaned = []
+        for line in raw_lines:
+            line = line.strip()
+            if not line:
+                continue
+            low = line.lower()
+            if any(low.startswith(p) for p in (
+                "here are", "here is", "the following", "below are",
+                "certainly", "of course", "i've", "i have",
+            )):
+                continue
+            line = re.sub(r'^\s*\d+\s*[\.\)\-]\s*', '', line).strip()
+            if line:
+                cleaned.append(line)
+        return cleaned
+
+    def _align_sentences(self, batch: List[Subtitle], cleaned: List[str]) -> List[Subtitle]:
+        """Assign timestamps to output sentences via fuzzy matching with input lines."""
+        if not cleaned:
+            return list(batch)
+
+        # Find best matching input index for each output sentence (Jaccard word overlap)
+        assignments = []
+        for out_text in cleaned:
+            out_words = set(w.lower() for w in out_text.split())
+            best_i, best_score = 0, 0
+            for i, sub in enumerate(batch):
+                in_words = set(w.lower() for w in sub.text.split())
+                if not in_words:
+                    continue
+                score = len(out_words & in_words) / len(out_words | in_words)
+                if score > best_score:
+                    best_score = score
+                    best_i = i
+            assignments.append(best_i)
+
+        # Build output, resolving merge (1 out ← many in) and split (many out ← 1 in)
         out = []
-        for orig, text in zip(batch, cleaned):
-            out.append(Subtitle(
-                start=orig.start, end=orig.end,
-                text=text or orig.text,
-            ))
+        used_until = -1
+        for pos, (out_text, inp_idx) in enumerate(zip(cleaned, assignments)):
+            if inp_idx <= used_until:
+                # Split: share the input line's time with the previous output
+                prev = out[-1]
+                sub = batch[inp_idx]
+                mid = (prev.start + prev.end) / 2
+                prev.end = mid
+                out.append(Subtitle(start=mid, end=sub.end, text=out_text))
+            else:
+                # Merge: output covers input lines from used_until+1 through inp_idx
+                start = batch[used_until + 1].start
+                end = batch[inp_idx].end
+                out.append(Subtitle(start=start, end=end, text=out_text))
+                used_until = inp_idx
+
         return out
 
     # ── Streaming pipeline ────────────────────────────────────────────────
@@ -323,12 +415,13 @@ class Pipeline:
                         clean_q.put(None)
                         self._emit(f"[LLM] done — {cleaned_count[0]} segments")
                         # Unload Ollama model to free GPU memory for next run
-                        try:
-                            import ollama
-                            ollama.generate(model=model_name, prompt="ok", keep_alive=0,
-                                            options={"num_predict": 1})
-                        except Exception:
-                            pass
+                        if not model_name.endswith(":cloud"):
+                            try:
+                                import ollama
+                                ollama.generate(model=model_name, prompt="ok", keep_alive=0,
+                                                options={"num_predict": 1})
+                            except Exception:
+                                pass
                         break
                     if first[0]:
                         first[0] = False
@@ -457,7 +550,7 @@ class App(tk.Tk):
         self.v_translate    = tk.BooleanVar(value=True)
         self.v_llm_cleanup = tk.BooleanVar(value=True)
         self.v_lang      = tk.StringVar(value="ko")
-        self.v_model     = tk.StringVar(value="llama3.2:1b")
+        self.v_model     = tk.StringVar(value="qwen3")
         self.v_status    = tk.StringVar(value="Ready — browse a file to begin.")
         self.v_progress  = tk.DoubleVar(value=0)
         self.v_asr_prog  = tk.DoubleVar(value=0)
@@ -511,10 +604,10 @@ class App(tk.Tk):
                        bg=PANEL, fg="white", selectcolor=ACCENT,
                        activebackground=PANEL, activeforeground="white",
                        command=self._on_llm_cleanup_toggle).pack(side="left")
-        self.ent_model = tk.Entry(sr, textvariable=self.v_model, width=13,
-                                   bg=ACCENT, fg="white", insertbackground="white",
-                                   relief="flat", state="disabled")
-        self.ent_model.pack(side="left", padx=(2, 14))
+        self.cmb_model = ttk.Combobox(sr, textvariable=self.v_model,
+                                      width=18, state="readonly")
+        self.cmb_model["values"] = ["qwen3", "qwen3:32b", "deepseek-v4-pro:cloud"]
+        self.cmb_model.pack(side="left", padx=(2, 14))
 
         tk.Checkbutton(sr, text="Translate", variable=self.v_translate,
                        bg=PANEL, fg="white", selectcolor=ACCENT,
@@ -534,6 +627,30 @@ class App(tk.Tk):
                              "large-v2", "large-v3"]
         cmb_wm.pack(side="left", padx=2)
 
+        # ASR + TRA progress bars — stacked vertically, right of Whisper
+        prog_col = tk.Frame(sr, bg=PANEL)
+        prog_col.pack(side="left", fill="x", expand=True, padx=(10, 0))
+
+        asr_row = tk.Frame(prog_col, bg=PANEL)
+        asr_row.pack(fill="x")
+        self._lbl(asr_row, "ASR:", fg="#e74c3c", bg=PANEL, width=4,
+                  anchor="e").pack(side="left", padx=(0, 4))
+        ttk.Progressbar(asr_row, variable=self.v_asr_prog, maximum=100,
+                        length=160, style="Bar.Horizontal.TProgressbar"
+                        ).pack(side="left", fill="x", expand=True)
+        self._lbl(asr_row, textvariable=self.v_asr_label, fg="#aaa", bg=PANEL,
+                  width=18, anchor="w").pack(side="left", padx=4)
+
+        tra_row = tk.Frame(prog_col, bg=PANEL)
+        tra_row.pack(fill="x")
+        self._lbl(tra_row, "TRA:", fg="#2ecc71", bg=PANEL, width=4,
+                  anchor="e").pack(side="left", padx=(0, 4))
+        ttk.Progressbar(tra_row, variable=self.v_tra_prog, maximum=100,
+                        length=160, style="Bar.Horizontal.TProgressbar"
+                        ).pack(side="left", fill="x", expand=True)
+        self._lbl(tra_row, textvariable=self.v_tra_label, fg="#aaa", bg=PANEL,
+                  width=18, anchor="w").pack(side="left", padx=4)
+
         # Action row
         ar = tk.Frame(top, bg=PANEL)
         ar.pack(fill="x", padx=6, pady=4)
@@ -545,36 +662,37 @@ class App(tk.Tk):
                          ).pack(side="left", padx=10)
         self._lbl(ar, textvariable=self.v_status, fg="#aaa").pack(side="left")
 
-        # ── Parallel progress bars ──────────────────────────────────────────
-        pp = tk.Frame(self, bg=PANEL, pady=2)
-        pp.pack(fill="x", padx=8, pady=(2, 0))
-        for var, lbl_var, color, name in [
-            (self.v_asr_prog, self.v_asr_label, "#e74c3c", "ASR"),
-            (self.v_tra_prog, self.v_tra_label, "#2ecc71", "TRA"),
-        ]:
-            row = tk.Frame(pp, bg=PANEL)
-            row.pack(fill="x", padx=4, pady=1)
-            self._lbl(row, f"{name}:", fg=color, bg=PANEL, width=5,
-                      anchor="e").pack(side="left", padx=(0, 4))
-            ttk.Progressbar(row, variable=var, maximum=100,
-                            length=300, style="Bar.Horizontal.TProgressbar"
-                            ).pack(side="left", fill="x", expand=True)
-            self._lbl(row, textvariable=lbl_var, fg="#aaa", bg=PANEL,
-                      width=18, anchor="w").pack(side="left", padx=4)
+        # ── Main content area: resizable left/right split ───────────────────
+        pane = tk.PanedWindow(self, bg=DARK, sashwidth=4, orient="horizontal")
+        pane.pack(fill="both", expand=True, padx=8, pady=4)
 
-        # ── Video area ─────────────────────────────────────────────────────
-        self.video_frame = tk.Frame(self, bg="black")
-        self.video_frame.pack(fill="both", expand=True, padx=8, pady=4)
+        # Left: video + subtitle stacked
+        left_col = tk.Frame(pane, bg="black")
+        pane.add(left_col, stretch="always", minsize=400, width=680)
+        left_col.rowconfigure(0, weight=1)
+        left_col.rowconfigure(1, weight=0)
+        left_col.columnconfigure(0, weight=1)
 
-        # ── Subtitle bar ───────────────────────────────────────────────────
-        sub_bg = tk.Frame(self, bg="black", height=44)
-        sub_bg.pack(fill="x", padx=8)
+        self.video_frame = tk.Frame(left_col, bg="black")
+        self.video_frame.grid(row=0, column=0, sticky="nsew")
+
+        sub_bg = tk.Frame(left_col, bg="black", height=44)
+        sub_bg.grid(row=1, column=0, sticky="ew")
         sub_bg.pack_propagate(False)
-        tk.Label(sub_bg, textvariable=self.v_subtitle,
+        self.lbl_subtitle = tk.Label(sub_bg, textvariable=self.v_subtitle,
                  bg="black", fg="#FFFF00",
                  font=("Arial", 14, "bold"),
-                 wraplength=940, justify="center"
-                 ).pack(fill="both", expand=True)
+                 justify="center")
+        self.lbl_subtitle.pack(fill="both", expand=True)
+        sub_bg.bind("<Configure>", self._on_subtitle_resize)
+
+        # Right: log console
+        right_col = tk.Frame(pane, bg=PANEL)
+        pane.add(right_col, stretch="always", minsize=120, width=280)
+        self.log_box = scrolledtext.ScrolledText(
+            right_col, bg="#0d1b2a", fg="#7ec8e3",
+            font=("Courier", 9), relief="flat")
+        self.log_box.pack(fill="both", expand=True)
 
         # ── Player controls ────────────────────────────────────────────────
         pc = tk.Frame(self, bg=ACCENT, pady=5)
@@ -606,13 +724,6 @@ class App(tk.Tk):
         self.vol_scale.set(80)
         self.vol_scale.pack(side="left", padx=4)
 
-        # ── Log console ────────────────────────────────────────────────────
-        log_fr = tk.Frame(self, bg=PANEL)
-        log_fr.pack(fill="x", padx=8, pady=(0, 8))
-        self.log_box = scrolledtext.ScrolledText(
-            log_fr, height=4, bg="#0d1b2a", fg="#7ec8e3",
-            font=("Courier", 9), state="disabled", relief="flat")
-        self.log_box.pack(fill="x")
 
     # ── VLC init ──────────────────────────────────────────────────────────────
 
@@ -770,9 +881,13 @@ class App(tk.Tk):
                 pass
             time.sleep(0.08)
 
+    def _on_subtitle_resize(self, event):
+        """Keep subtitle wraplength in sync with the video frame width."""
+        self.lbl_subtitle.configure(wraplength=event.width - 4)
+
     def _on_space_toggle(self, event):
-        """Space / Enter toggles play/pause, but not when typing in a text field."""
-        if isinstance(event.widget, (tk.Entry, tk.Text)):
+        """Space / Enter toggles play/pause, but not when typing or using dropdown."""
+        if isinstance(event.widget, (tk.Entry, tk.Text, ttk.Combobox)):
             return
         self._toggle_play()
 
@@ -879,8 +994,8 @@ class App(tk.Tk):
             state="readonly" if self.v_translate.get() else "disabled")
 
     def _on_llm_cleanup_toggle(self):
-        self.ent_model.config(
-            state="normal" if self.v_llm_cleanup.get() else "disabled")
+        self.cmb_model.config(
+            state="readonly" if self.v_llm_cleanup.get() else "disabled")
 
     def _log(self, msg: str):
         def _do():
