@@ -207,7 +207,7 @@ class Pipeline:
             "Fix ASR errors, punctuation, capitalization, and word fragments.\n"
             "Your output will be displayed directly as subtitles.\n"
             "Do NOT add any preamble, commentary, or sentence numbering (no \"1.\", \"2.\", etc.).\n"
-            "Invoca, Workato, Service Titan, Backstage, MCP, FDE, Next Health and University Hospital are proper noun frequently addressed in video.\n"
+            "Invoca, Workato, Service Titan, Backstage, MCP, FDE, TrueFoundry, NexHealth and University Hospital are proper noun frequently addressed in video.\n"
             "Trent, Anneke, Nab, Christian, Whitney, Landon, Pierce, Justin, Muzafar, Toshishi, Beth, Ola, Evan, Ian and Nancy are people's name frequently addressed in video.\n"
             "But asr may misrecognize them, you need to modify them.\n"
             "Output one complete sentence per line — nothing else.\n\n"
