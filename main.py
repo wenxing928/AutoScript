@@ -731,7 +731,7 @@ class App(tk.Tk):
         try:
             import vlc
             self.vlc = vlc
-            self.vlc_inst = vlc.Instance("--no-xlib", "--quiet")
+            self.vlc_inst = vlc.Instance("--no-xlib", "--quiet", "--no-spu")
             self.player = self.vlc_inst.media_player_new()
             self.player.audio_set_volume(80)
             self._log("VLC initialised.")
@@ -851,11 +851,12 @@ class App(tk.Tk):
             return
         self._embed_player()
         media = self.vlc_inst.media_new(self.media_file)
-        media.add_option(":no-sub")            # skip loading subtitle tracks
+        media.add_option(":no-spu")            # disable embedded subtitle tracks entirely
         self.player.set_media(media)
         self.player.play()
-        # Retry after a tick — spu track may not be available until playback starts
-        self.after(100, lambda: self.player.video_set_spu(-1))
+        # VLC may discover SPU tracks lazily during playback — keep disabling
+        for delay in (100, 500, 1000, 2000, 4000):
+            self.after(delay, lambda: self.player.video_set_spu(-1))
         self.btn_play.config(text="⏸")
         self._sub_running = True
         threading.Thread(target=self._sub_sync_loop, daemon=True).start()
