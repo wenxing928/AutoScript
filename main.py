@@ -566,9 +566,11 @@ class App(tk.Tk):
         self._on_translate_toggle()     # sync UI with default (True)
         self._init_vlc()
 
-        # Keyboard shortcuts: Space / Enter to toggle play/pause
-        self.bind("<space>", self._on_space_toggle)
-        self.bind("<Return>", self._on_space_toggle)
+        # Keyboard shortcuts (bind_all so VLC's embedded window doesn't steal focus)
+        self.bind_all("<space>", self._on_space_toggle)
+        self.bind_all("<Return>", self._on_space_toggle)
+        self.bind_all("<Left>", lambda e: self._on_step(e, -2000))
+        self.bind_all("<Right>", lambda e: self._on_step(e, 2000))
         self.after(200, self._cuda_check)
         self._ui_loop()
 
@@ -891,6 +893,18 @@ class App(tk.Tk):
         if isinstance(event.widget, (tk.Entry, tk.Text, ttk.Combobox)):
             return
         self._toggle_play()
+
+    def _on_step(self, event, delta_ms):
+        """Left/Right arrow — seek ±2 s, but not when typing."""
+        if isinstance(event.widget, (tk.Entry, tk.Text, ttk.Combobox)):
+            return
+        if not self.player:
+            return
+        cur = self.player.get_time()
+        total = self.player.get_length()
+        if cur < 0 or total <= 0:
+            return
+        self.player.set_time(max(0, min(total, cur + delta_ms)))
 
     def _toggle_play(self):
         if not self.player:
