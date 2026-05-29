@@ -225,7 +225,8 @@ class Pipeline:
         import ollama
         try:
             self._emit(f"[LLM] calling Ollama ({model_name}, {len(lines)} lines, {len(prompt)} chars)")
-            resp = ollama.generate(
+            client = ollama.Client(timeout=120)
+            resp = client.generate(
                 model=model_name, prompt=prompt,
                 options={"num_predict": 512, "temperature": 0.0},
             )
@@ -418,7 +419,8 @@ class Pipeline:
                         if not model_name.endswith(":cloud"):
                             try:
                                 import ollama
-                                ollama.generate(model=model_name, prompt="ok", keep_alive=0,
+                                client = ollama.Client(timeout=30)
+                                client.generate(model=model_name, prompt="ok", keep_alive=0,
                                                 options={"num_predict": 1})
                             except Exception:
                                 pass
@@ -457,14 +459,29 @@ class Pipeline:
                 from deep_translator import GoogleTranslator
                 tr = GoogleTranslator(source="auto", target=translate_lang)
                 first = True
+                fail_count = [0]
                 while True:
                     item = clean_q.get()
                     if item is None:
-                        self._emit(f"[translate] done — {tra_count[0]}")
+                        self._emit(f"[translate] done — {tra_count[0]} ({fail_count[0]} fallbacks)")
                         self._tra_prog(100, f"done — {tra_count[0]}")
                         break
                     start_t, end_t, text = item
-                    translated = tr.translate(text) or text
+                    translated = None
+                    for attempt in range(3):
+                        try:
+                            translated = tr.translate(text)
+                            if translated:
+                                break
+                        except Exception as e:
+                            if attempt < 2:
+                                self._emit(f"[translate] retry {attempt+1}/3: {e}")
+                                time.sleep(1.5)
+                            else:
+                                self._emit(f"[translate] FAILED — using original: {e}")
+                    if not translated:
+                        translated = text
+                        fail_count[0] += 1
                     sub = Subtitle(start=start_t, end=end_t,                                    text=text, translated=translated)
                     final_subs.append(sub)
                     if on_subtitle:
@@ -540,6 +557,7 @@ class App(tk.Tk):
         self._seeking = False
         self._sub_running = False
         self._cur_sub = ""
+        self._fullscreen = False
         self.player = None
         self.vlc = None
         self.vlc_inst = None
@@ -571,6 +589,8 @@ class App(tk.Tk):
         self.bind_all("<Return>", self._on_space_toggle)
         self.bind_all("<Left>", lambda e: self._on_step(e, -2000))
         self.bind_all("<Right>", lambda e: self._on_step(e, 2000))
+        self.bind_all("<KeyPress-f>", self._toggle_fullscreen)
+        self.bind_all("<Escape>", self._exit_fullscreen)
         self.after(200, self._cuda_check)
         self._ui_loop()
 
@@ -581,11 +601,11 @@ class App(tk.Tk):
                                   background=BLUE, troughcolor="#333")
 
         # ── Top control panel ──────────────────────────────────────────────
-        top = tk.Frame(self, bg=PANEL, pady=6)
-        top.pack(fill="x", padx=8, pady=(8, 0))
+        self.top_panel = tk.Frame(self, bg=PANEL, pady=6)
+        self.top_panel.pack(fill="x", padx=8, pady=(8, 0))
 
         # File row
-        fr = tk.Frame(top, bg=PANEL)
+        fr = tk.Frame(self.top_panel, bg=PANEL)
         fr.pack(fill="x", padx=6, pady=2)
         self._lbl(fr, "File:").pack(side="left")
         self.lbl_file = self._lbl(fr, "No file selected", fg="#888")
@@ -593,7 +613,7 @@ class App(tk.Tk):
         self._btn(fr, "Browse…", self._browse, BLUE).pack(side="right")
 
         # Settings row
-        sr = tk.Frame(top, bg=PANEL)
+        sr = tk.Frame(self.top_panel, bg=PANEL)
         sr.pack(fill="x", padx=6, pady=3)
 
         self._lbl(sr, "Device:").pack(side="left")
@@ -654,7 +674,7 @@ class App(tk.Tk):
                   width=18, anchor="w").pack(side="left", padx=4)
 
         # Action row
-        ar = tk.Frame(top, bg=PANEL)
+        ar = tk.Frame(self.top_panel, bg=PANEL)
         ar.pack(fill="x", padx=6, pady=4)
         self.btn_proc = self._btn(ar, "▶  Prepare & Process",
                                    self._start_process, GREEN)
@@ -665,61 +685,64 @@ class App(tk.Tk):
         self._lbl(ar, textvariable=self.v_status, fg="#aaa").pack(side="left")
 
         # ── Main content area: resizable left/right split ───────────────────
-        pane = tk.PanedWindow(self, bg=DARK, sashwidth=4, orient="horizontal")
-        pane.pack(fill="both", expand=True, padx=8, pady=4)
+        self.main_pane = tk.PanedWindow(self, bg=DARK, sashwidth=4, orient="horizontal")
+        self.main_pane.pack(fill="both", expand=True, padx=8, pady=4)
 
         # Left: video + subtitle stacked
-        left_col = tk.Frame(pane, bg="black")
-        pane.add(left_col, stretch="always", minsize=400, width=680)
-        left_col.rowconfigure(0, weight=1)
-        left_col.rowconfigure(1, weight=0)
-        left_col.columnconfigure(0, weight=1)
+        self.left_col = tk.Frame(self.main_pane, bg="black")
+        self.main_pane.add(self.left_col, stretch="always", minsize=400, width=680)
+        self.left_col.rowconfigure(0, weight=1)
+        self.left_col.rowconfigure(1, weight=0)
+        self.left_col.columnconfigure(0, weight=1)
 
-        self.video_frame = tk.Frame(left_col, bg="black")
+        self.video_frame = tk.Frame(self.left_col, bg="black")
         self.video_frame.grid(row=0, column=0, sticky="nsew")
 
-        sub_bg = tk.Frame(left_col, bg="black", height=44)
-        sub_bg.grid(row=1, column=0, sticky="ew")
-        sub_bg.pack_propagate(False)
-        self.lbl_subtitle = tk.Label(sub_bg, textvariable=self.v_subtitle,
+        self.sub_bg = tk.Frame(self.left_col, bg="black", height=44)
+        self.sub_bg.grid(row=1, column=0, sticky="ew")
+        self.sub_bg.pack_propagate(False)
+        self.lbl_subtitle = tk.Label(self.sub_bg, textvariable=self.v_subtitle,
                  bg="black", fg="#FFFF00",
                  font=("Arial", 14, "bold"),
                  justify="center")
         self.lbl_subtitle.pack(fill="both", expand=True)
-        sub_bg.bind("<Configure>", self._on_subtitle_resize)
+        self.sub_bg.bind("<Configure>", self._on_subtitle_resize)
+
+        self.video_frame.bind("<Double-Button-1>", self._toggle_fullscreen)
 
         # Right: log console
-        right_col = tk.Frame(pane, bg=PANEL)
-        pane.add(right_col, stretch="always", minsize=120, width=280)
+        self.right_col = tk.Frame(self.main_pane, bg=PANEL)
+        self.main_pane.add(self.right_col, stretch="always", minsize=120, width=280)
         self.log_box = scrolledtext.ScrolledText(
-            right_col, bg="#0d1b2a", fg="#7ec8e3",
+            self.right_col, bg="#0d1b2a", fg="#7ec8e3",
             font=("Courier", 9), relief="flat")
         self.log_box.pack(fill="both", expand=True)
 
         # ── Player controls ────────────────────────────────────────────────
-        pc = tk.Frame(self, bg=ACCENT, pady=5)
-        pc.pack(fill="x", padx=8, pady=(0, 4))
+        self.controls_bar = tk.Frame(self, bg=ACCENT, pady=5)
+        self.controls_bar.pack(fill="x", padx=8, pady=(0, 4))
 
         icon_kw = dict(fg="white", relief="flat",
                        padx=10, pady=4, font=("Arial", 11), cursor="hand2")
-        self._btn(pc, "⏮", self._seek_start, BTN, **icon_kw).pack(side="left", padx=2)
-        self.btn_play = tk.Button(pc, text="▶", command=self._toggle_play,
+        self._btn(self.controls_bar, "⏮", self._seek_start, BTN, **icon_kw).pack(side="left", padx=2)
+        self.btn_play = tk.Button(self.controls_bar, text="▶", command=self._toggle_play,
                                    bg=GREEN, **icon_kw)
         self.btn_play.pack(side="left", padx=2)
-        self._btn(pc, "⏭", self._seek_end, BTN, **icon_kw).pack(side="left", padx=2)
+        self._btn(self.controls_bar, "⏭", self._seek_end, BTN, **icon_kw).pack(side="left", padx=2)
+        self._btn(self.controls_bar, "⛶", self._toggle_fullscreen, BTN, **icon_kw).pack(side="left", padx=2)
 
-        seek = ttk.Scale(pc, variable=self.v_seek,
+        seek = ttk.Scale(self.controls_bar, variable=self.v_seek,
                           from_=0, to=1000, orient="horizontal")
         seek.pack(side="left", fill="x", expand=True, padx=8)
         seek.bind("<ButtonPress-1>", self._on_seek_press)
         seek.bind("<ButtonRelease-1>", self._on_seek_release)
 
-        tk.Label(pc, textvariable=self.v_time,
+        tk.Label(self.controls_bar, textvariable=self.v_time,
                  bg=ACCENT, fg="white",
                  font=("Courier", 10)).pack(side="left", padx=6)
 
-        self._lbl(pc, "Vol:", bg=ACCENT).pack(side="left")
-        self.vol_scale = tk.Scale(pc, from_=0, to=100, orient="horizontal",
+        self._lbl(self.controls_bar, "Vol:", bg=ACCENT).pack(side="left")
+        self.vol_scale = tk.Scale(self.controls_bar, from_=0, to=100, orient="horizontal",
                                    length=90, bg=ACCENT, fg="white",
                                    troughcolor=BTN, highlightthickness=0,
                                    showvalue=False, command=self._set_volume)
@@ -828,8 +851,15 @@ class App(tk.Tk):
             base = os.path.splitext(self.media_file)[0]
             self.srt_path = base + "_ai.srt"
             save_cache(all_subs, self.media_file, translate_lang or "")
-            save_srt(all_subs, self.srt_path, self.v_translate.get())
-            self._log(f"Saved → {self.srt_path}  (+ cache)")
+            # Always save original (untranslated) SRT
+            save_srt(all_subs, base + "_ai_original.srt", use_translation=False)
+            self._log(f"Saved → {base}_ai_original.srt (original)")
+            # If translating, also save the translated SRT
+            if translate_lang:
+                save_srt(all_subs, self.srt_path, use_translation=True)
+                self._log(f"Saved → {self.srt_path}  (translated)  (+ cache)")
+            else:
+                self._log("(+ cache)")
 
         except Exception as e:
             import traceback
@@ -880,6 +910,12 @@ class App(tk.Tk):
                         if text != self._cur_sub:
                             self._cur_sub = text
                             self.after(0, lambda t=text: self.v_subtitle.set(t))
+                            if self._fullscreen and self.player:
+                                try:
+                                    self.player.video_set_marquee_int(0, 1)  # Enable
+                                    self.player.video_set_marquee_string(1, text)  # Text
+                                except Exception:
+                                    pass
             except Exception:
                 pass
             time.sleep(0.08)
@@ -905,6 +941,53 @@ class App(tk.Tk):
         if cur < 0 or total <= 0:
             return
         self.player.set_time(max(0, min(total, cur + delta_ms)))
+
+    def _toggle_fullscreen(self, event=None):
+        """Enter/exit fullscreen. Toggled by F key, double-click, or button."""
+        if event is not None and isinstance(event.widget, (tk.Entry, tk.Text, ttk.Combobox)):
+            return
+        if self._fullscreen:
+            self._exit_fullscreen()
+        else:
+            self._enter_fullscreen()
+
+    def _enter_fullscreen(self):
+        self._fullscreen = True
+        self.top_panel.pack_forget()
+        self.controls_bar.pack_forget()
+        self.main_pane.forget(self.right_col)
+        self.sub_bg.grid_remove()
+        self.attributes("-fullscreen", True)
+        # Configure VLC marquee for on-video subtitles
+        if self.player:
+            try:
+                self.player.video_set_marquee_int(0, 1)    # Enable
+                self.player.video_set_marquee_int(6, 34)   # Size (pixels)
+                self.player.video_set_marquee_int(2, 0xFFFF00)  # Color (yellow)
+                self.player.video_set_marquee_int(3, 255)  # Opacity
+                self.player.video_set_marquee_int(4, 8)    # Position: bottom
+                self.player.video_set_marquee_int(5, 80)   # Refresh period (ms)
+            except Exception:
+                pass
+
+    def _exit_fullscreen(self, event=None):
+        if event is not None and isinstance(event.widget, (tk.Entry, tk.Text, ttk.Combobox)):
+            return
+        if not self._fullscreen:
+            return
+        self._fullscreen = False
+        self.attributes("-fullscreen", False)
+        # Disable VLC marquee
+        if self.player:
+            try:
+                self.player.video_set_marquee_int(0, 0)  # Disable
+            except Exception:
+                pass
+        # Restore hidden panels in original order
+        self.top_panel.pack(fill="x", padx=8, pady=(8, 0), before=self.main_pane)
+        self.main_pane.add(self.right_col, stretch="always", minsize=120, width=280)
+        self.controls_bar.pack(fill="x", padx=8, pady=(0, 4), after=self.main_pane)
+        self.sub_bg.grid()
 
     def _toggle_play(self):
         if not self.player:
